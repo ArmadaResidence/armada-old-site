@@ -49,28 +49,49 @@ async function shoot(ctx, url, { archive, en }) {
       const missing = await page.evaluate(() => [...document.images].filter((i) => i.complete && i.naturalWidth === 0 && i.getAttribute('src') !== 'data:,').map((i) => i.currentSrc || i.src));
       if (missing.length) console.log('   broken images', url, missing.slice(0, 5));
     }
-    return await page.screenshot({ fullPage: true });
+    try { return await page.screenshot({ fullPage: true, timeout: 180000 }); }
+    catch (e) {
+      // very tall pages: capture in tiles and stitch
+      const { w, h } = await page.evaluate(() => ({ w: document.documentElement.clientWidth, h: document.documentElement.scrollHeight }));
+      const out = new PNG({ width: w, height: h }); const T = 4000;
+      for (let y = 0; y < h; y += T) {
+        const buf = await page.screenshot({ fullPage: true, clip: { x: 0, y, width: w, height: Math.min(T, h - y) }, timeout: 180000 });
+        const t = PNG.sync.read(buf);
+        for (let r = 0; r < t.height && y + r < h; r++) t.data.copy(out.data, (y + r) * w * 4, r * t.width * 4, r * t.width * 4 + Math.min(t.width, w) * 4);
+      }
+      console.log('   tiled screenshot', url, h);
+      return PNG.sync.write(out);
+    }
   } finally { await page.close().catch(() => {}); }
 }
 
 (async () => {
   const browser = await launch();
   const results = []; let i = 0;
-  await Promise.all(Array.from({ length: 3 }, async () => {
+  await Promise.all(Array.from({ length: +(process.env.CONC || 3) }, async () => {
     const ctx = { desktop: await newContext(browser, 'desktop'), mobile: await newContext(browser, 'mobile') };
     while (i < pages.length) {
       const pg = pages[i++];
       const live = ORIGIN + (pg.path === '/' ? '/' : encodeURI(pg.path));
       const arch = BASE + pg.dir.split('/').map(encodeURIComponent).join('/');
-      for (const kind of ['desktop', 'mobile']) {
+      for (const kind of (process.env.KINDS || 'desktop,mobile').split(',')) {
         try {
-          const [a, l] = await Promise.all([shoot(ctx[kind], arch, { archive: true, en: pg.lang === 'en' }), shoot(ctx[kind], live, { archive: false, en: pg.lang === 'en' })]);
-          const d = diff(a, l);
+          let a, l, d, tries = 0;
+          for (;;) {
+            tries++;
+            try {
+              if (process.env.SEQ) { a = await shoot(ctx[kind], arch, { archive: true, en: pg.lang === 'en' }); l = await shoot(ctx[kind], live, { archive: false, en: pg.lang === 'en' }); }
+              else [a, l] = await Promise.all([shoot(ctx[kind], arch, { archive: true, en: pg.lang === 'en' }), shoot(ctx[kind], live, { archive: false, en: pg.lang === 'en' })]);
+              d = diff(a, l);
+            } catch (e) { if (tries < 3) continue; throw e; }
+            if (d.pct <= 1 || tries >= 2) break;
+          }
+          d.tries = tries;
           const name = `${slugOf(pg.path)}-${pg.lang}-${kind}`;
           fs.writeFileSync(path.join(DIFF, name + '-diff.png'), d.png);
           fs.writeFileSync(path.join(DIFF, name + '-archive.png'), a);
           fs.writeFileSync(path.join(DIFF, name + '-live.png'), l);
-          results.push({ dir: pg.dir, lang: pg.lang, kind, pct: d.pct, hArchive: d.hA, hLive: d.hB, bands: d.bands });
+          results.push({ dir: pg.dir, lang: pg.lang, kind, tries: d.tries, pct: d.pct, hArchive: d.hA, hLive: d.hB, bands: d.bands });
           console.log(`${d.pct.toFixed(2).padStart(6)}%  ${kind.padEnd(7)} /${pg.dir}  h ${d.hA}/${d.hB}  bands ${d.bands.join(',')}`);
         } catch (e) { console.log('ERR', pg.dir, kind, e.message.split('\n')[0]); results.push({ dir: pg.dir, lang: pg.lang, kind, error: e.message.split('\n')[0] }); }
       }
